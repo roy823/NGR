@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=65.5"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ngr-registration"
+version = "0.1.0"
+description = "Motif-seeded rigid correspondence registration"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+authors = [{name = "Chengrui Xu"}]
+dependencies = ["numpy==1.26.4", "scipy==1.15.3", "torch==2.5.1"]
+
+[project.optional-dependencies]
+surface = ["open3d==0.20.0"]
+test = ["pytest==9.0.3"]
+
+[tool.setuptools]
+packages = ["ngr"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

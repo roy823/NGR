@@ -1,0 +1,15 @@
+*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/pyproject.toml
+!/ngr/
+!/ngr/__init__.py
+!/ngr/_core.py
+!/ngr/_rigid.py
+!/ngr/_surface.py
+!/ngr/registration.py
+!/docs/
+!/docs/method.md
+!/tests/
+!/tests/test_registration.py
