@@ -1,4 +1,6 @@
 """Observed-surface evidence, candidate selection and point-to-plane ICP."""
+from time import perf_counter
+
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -14,13 +16,7 @@ def sampled_points(points, maximum=4096):
     split = len(points) // 2
     return (points[order[:min(maximum, split)]], points[order[split:split + maximum]])
 
-def geometry_score(source, target, source_query, target_query, rotation, translation, radius):
-    target_tree, source_tree = (cKDTree(target), cKDTree(source))
-    forward = target_tree.query(source_query[None] @ rotation.transpose(0, 2, 1) + translation[:, None], workers=1)[0]
-    reverse = source_tree.query((target_query[None] - translation[:, None]) @ rotation, workers=1)[0]
-    a = np.maximum(1 - forward / radius, 0).mean(-1)
-    b = np.maximum(1 - reverse / radius, 0).mean(-1)
-    return (2 * a * b / (a + b + 1e-12), a, b)
+
 def normals(points):
     if len(points) < 3:
         raise ValueError('A surface patch needs at least three points')
@@ -46,15 +42,9 @@ def information_weights(points, normal):
 def query_weights(query):
     return information_weights(query, normals(query))
 
-def harmonic(a, b):
-    return 2 * a * b / (a + b + 1e-12)
 
-def geometry(source, target, sq, tq, R, t, sw, tw):
-    forward = cKDTree(target).query(sq[None] @ R.transpose(0, 2, 1) + t[:, None], workers=1)[0]
-    reverse = cKDTree(source).query((tq[None] - t[:, None]) @ R, workers=1)[0]
-    a = np.maximum(1 - forward / 0.1, 0)
-    b = np.maximum(1 - reverse / 0.1, 0)
-    return (harmonic(a @ sw, b @ tw), harmonic(a.mean(-1), b.mean(-1)))
+
+
 def legal(rotation, translation):
     R, t = (np.asarray(rotation), np.asarray(translation))
     if R.ndim != 3 or R.shape[1:] != (3, 3) or t.shape != (len(R), 3):
@@ -167,3 +157,115 @@ class SurfaceICP:
         rotation = matrix[:3, :3]
         valid = np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-05) and np.linalg.det(rotation) > 0
         return (dict(valid=bool(valid), R=rotation.tolist(), t=matrix[:3, 3].tolist()), stages)
+
+
+class Evidence:
+    def __init__(self, source, target):
+        self.source, self.target = source, target
+        _, self.sq = sampled_points(source)
+        _, self.tq = sampled_points(target)
+        self.source_tree, self.target_tree = cKDTree(source), cKDTree(target)
+        self.sw = self.tw = None
+
+    def weights(self):
+        if self.sw is None:
+            self.sw, self.tw = query_weights(self.sq), query_weights(self.tq)
+
+    def score(self, R, t, information=False, early=False):
+        if information:
+            self.weights()
+        sq, tq = (self.sq[:128], self.tq[:128]) if early else (self.sq, self.tq)
+        if information:
+            sw, tw = (self.sw[:128]/self.sw[:128].sum(), self.tw[:128]/self.tw[:128].sum()) if early else (self.sw, self.tw)
+        scores = []
+        # Bound memory without truncating any pose. NGR's entire <=2048 pool
+        # remains a single matrix; larger pose pools are evaluated in blocks.
+        for offset in range(0, len(R), 8192):
+            r, translation = R[offset:offset+8192], t[offset:offset+8192]
+            forward = self.target_tree.query(sq[None]@r.transpose(0,2,1)+translation[:,None],workers=1)[0]
+            reverse = self.source_tree.query((tq[None]-translation[:,None])@r,workers=1)[0]
+            a, b = np.maximum(1-forward/.1,0), np.maximum(1-reverse/.1,0)
+            x, y = (a@sw, b@tw) if information else (a.mean(-1), b.mean(-1))
+            scores.append(2*x*y/(x+y+1e-12))
+        return np.concatenate(scores) if scores else np.empty(0)
+
+
+def empty_pose():
+    return dict(valid=False,R=None,t=None)
+
+
+def pose_at(post, index):
+    if index is None or not post['valid'][index]:
+        return empty_pose()
+    return dict(valid=True,R=post['refined_R'][index].tolist(),t=post['refined_t'][index].tolist())
+
+
+def choose(post, information, keep, budget):
+    stop=min(budget,len(post['valid']));retained=np.flatnonzero(post['valid'][:min(keep,stop)])
+    if not len(retained):return None
+    M,G=post['refined_M'],post['refined_G'];anchor=int(retained[np.argmax(M[retained]*np.sqrt(G[retained]))])
+    score=M[:stop]*np.sqrt(information[:stop])
+    permitted=np.flatnonzero(post['valid'][:stop]&(information[:stop]>=information[anchor])&(score>score[anchor]))
+    return int(permitted[np.argmax(score[permitted])]) if len(permitted) else anchor
+
+
+def process(p,q,source,target,raw_R,raw_t,native,aux_R=None,aux_t=None,maximum=32):
+    if maximum not in (16,32):raise ValueError('Budgets must be 16 or 32')
+    began=perf_counter();timing={};reuse=0;fresh=0;stages=[]
+    R,t=np.asarray(raw_R,dtype=np.float64),np.asarray(raw_t,dtype=np.float64)
+    if not native.get('valid',False):return dict(outcomes={'ICP1':empty_pose(),'16':empty_pose(),'32':empty_pose()},status='no_native_pose',seconds=perf_counter()-began)
+    if aux_R is None:aux_R,aux_t=np.empty((0,3,3)),np.empty((0,3))
+    initial=shortlist(p,q,R,t,np.asarray(native['R']),np.asarray(native['t']))
+    evidence=Evidence(source,target);backend=None
+    def polish(r,translation):
+        nonlocal backend,reuse,fresh
+        M=mae(p,q,r,translation);G=evidence.score(r,translation);parents=allocation(M,G)
+        if backend is None:backend=SurfaceICP(source,target)
+        fit_R=np.zeros((len(parents),3,3));fit_t=np.zeros((len(parents),3));valid=np.zeros(len(parents),dtype=bool)
+        for index,parent in enumerate(parents):
+            prediction,trace=backend.apply(dict(valid=True,R=r[parent],t=translation[parent]));fresh+=1;stages.append(trace)
+            if prediction['valid']:fit_R[index],fit_t[index],valid[index]=prediction['R'],prediction['t'],True
+        post_M,post_G=np.zeros(len(parents)),np.zeros(len(parents))
+        if valid.any():post_M[valid]=mae(p,q,fit_R[valid],fit_t[valid]);post_G[valid]=evidence.score(fit_R[valid],fit_t[valid])
+        return dict(R=r,t=translation,parents=parents,refined_R=fit_R,refined_t=fit_t,refined_M=post_M,refined_G=post_G,valid=valid)
+    base=polish(initial['R'],initial['t']);keep=len(base['parents']);timing['base_seconds']=perf_counter()-began;mark=perf_counter()
+    raw_ids=np.empty(0,dtype=int);extra_order=np.empty(0,dtype=int);screened=0;skyline_count=0
+    if maximum>keep:
+        proposals_R=np.concatenate((R,aux_R));proposals_t=np.concatenate((t,aux_t))
+        valid=legal(proposals_R,proposals_t);raw_ids=np.flatnonzero(valid);proposals_R,proposals_t=proposals_R[valid],proposals_t[valid]
+        M=mae(p,q,proposals_R,proposals_t);I=evidence.score(proposals_R,proposals_t,information=True,early=True);screened=len(M)
+        parents=base['parents'];unused=distinct(proposals_R,proposals_t,np.argsort(-I,kind='stable'),base['R'][parents],base['t'][parents],maximum=len(proposals_R))
+        skyline=unused[frontier(M[unused],I[unused])];skyline_count=len(skyline)
+        selected=skyline[np.argsort(-I[skyline],kind='stable')[:16]]
+        # The complete extra queue is ranked before cutting the global budget.
+        # This makes B16 and B32 genuine nested caps even when keep<16.
+        if len(selected):
+            extra_R,extra_t=proposals_R[selected],proposals_t[selected]
+            extra_M=mae(p,q,extra_R,extra_t);extra_G=evidence.score(extra_R,extra_t);order=allocation(extra_M,extra_G)
+            extra_order=order[:max(0,maximum-keep)];extra_R,extra_t=extra_R[extra_order],extra_t[extra_order]
+            extra_order=raw_ids[selected[extra_order]]
+        else:extra_R,extra_t=np.empty((0,3,3)),np.empty((0,3))
+    else:extra_R,extra_t=np.empty((0,3,3)),np.empty((0,3))
+    timing['screen_seconds']=perf_counter()-mark;mark=perf_counter()
+    if len(extra_R):
+        # The queue already carries allocation order. Preserve it while fitting.
+        if backend is None:backend=SurfaceICP(source,target)
+        fit_R=np.zeros_like(extra_R);fit_t=np.zeros_like(extra_t);valid=np.zeros(len(extra_R),dtype=bool)
+        for index in range(len(extra_R)):
+            pred,trace=backend.apply(dict(valid=True,R=extra_R[index],t=extra_t[index]));fresh+=1;stages.append(trace)
+            if pred['valid']:fit_R[index],fit_t[index],valid[index]=pred['R'],pred['t'],True
+        M,G=np.zeros(len(extra_R)),np.zeros(len(extra_R))
+        if valid.any():M[valid]=mae(p,q,fit_R[valid],fit_t[valid]);G[valid]=evidence.score(fit_R[valid],fit_t[valid])
+        extra=dict(refined_R=fit_R,refined_t=fit_t,refined_M=M,refined_G=G,valid=valid)
+        post={key:np.concatenate((base[key],extra[key])) for key in ('refined_R','refined_t','refined_M','refined_G','valid')}
+    else:post={key:base[key].copy() for key in ('refined_R','refined_t','refined_M','refined_G','valid')}
+    timing['extra_ICP_seconds']=perf_counter()-mark;mark=perf_counter()
+    information=evidence.score(post['refined_R'],post['refined_t'],information=True)
+    outcomes={'ICP1':pose_at(base,0)};indices={}
+    for budget in (16,32):
+        if budget>maximum:continue
+        indices[str(budget)]=choose(post,information,keep,budget);outcomes[str(budget)]=pose_at(post,indices[str(budget)])
+    timing['readout_seconds']=perf_counter()-mark
+    post.update(information_G=information,retained_ICP_count=np.array(keep),extra_initial_R=extra_R,extra_initial_t=extra_t,selected_raw_indices=extra_order)
+    return dict(outcomes=outcomes,indices=indices,status='complete',bank=post,screened=screened,skyline_modes=skyline_count,retained_calls=keep,total_calls=len(post['valid']),
+        fresh_ICP_calls=fresh,reused_ICP_calls=reuse,ICP_stages=stages,timing=timing,seconds=perf_counter()-began)

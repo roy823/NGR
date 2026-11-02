@@ -1,4 +1,4 @@
 """Nucleate--Grow--Refine rigid registration."""
-from .registration import prepare_indoor_surface, register_correspondences, register_indoor
+from .registration import register_correspondences, register_with_surfaces
 
-__all__ = ["register_correspondences", "register_indoor", "prepare_indoor_surface"]
+__all__ = ["register_correspondences", "register_with_surfaces"]
