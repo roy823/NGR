@@ -1,9 +1,9 @@
-"""Coordinate-to-pose interfaces with a common physical residual radius."""
+"""Rigid registration and reusable candidate verification in physical units."""
 import numpy as np
 
 from ._core import bank
 from ._rigid import seed_poses
-from ._surface import process
+from ._surface import legal, process
 
 
 def _matches(p, q):
@@ -16,10 +16,18 @@ def _matches(p, q):
 
 
 def _radius(value):
+    if np.ndim(value) != 0:
+        raise ValueError("inlier_radius must be a scalar")
     value = float(value)
     if not np.isfinite(value) or value <= 0:
         raise ValueError("inlier_radius must be finite and positive")
     return value
+
+
+def _budget(value):
+    if not isinstance(value, (int, np.integer)) or value not in (16, 32):
+        raise ValueError("budget must be 16 or 32")
+    return int(value)
 
 
 def _prepare_surface(points, radius):
@@ -36,63 +44,109 @@ def _prepare_surface(points, radius):
     return prepared
 
 
+def _poses(rotations, translations):
+    rotations = np.asarray(rotations, dtype=np.float64)
+    translations = np.asarray(translations, dtype=np.float64)
+    if (rotations.ndim != 3 or rotations.shape[1:] != (3, 3)
+            or translations.shape != (len(rotations), 3)):
+        raise ValueError("Expected rotations (K, 3, 3) and translations (K, 3)")
+    return rotations, translations
+
+
 def _candidates(p, q, radius):
-    scale, factor = .04 / radius, .1 / radius
+    scale = .04 / radius
     front = bank(p * scale, q * scale)
     R, t = front["rotation"], front["translation"] / scale
-    native_index = int(front["scores"].argmax())
-    native = dict(valid=True, R=R[native_index].copy(),
-                  t=np.asarray(t[native_index]).copy() * factor)
+    i = int(front["scores"].argmax())
+    native = dict(R=R[i].copy(), t=t[i].copy())
     seeds = front["seeds"]
     if seeds.shape[1] == 3:
         aux_R, internal = seed_poses(p * scale, q * scale, seeds)
         aux_t = internal / scale
     else:
         aux_R, aux_t = np.empty((0, 3, 3)), np.empty((0, 3))
-    return dict(R=R, t=t * factor, native=native,
-                aux_R=aux_R, aux_t=aux_t * factor)
+    return dict(R=R, t=t, native=native, aux_R=aux_R, aux_t=aux_t)
 
 
 def register_correspondences(p, q, *, inlier_radius=.04):
-    """Estimate q = p @ R.T + t using only tentative correspondences.
+    """Estimate q = p @ R.T + t with capacity-aware motif generation.
 
-    All coordinates and inlier_radius use the same physical unit. The default
-    retains the native model radius. The returned translation uses input units.
+    Correspondences and inlier_radius use the same physical unit. Return R
+    with shape (3, 3) and t with shape (3,), mapping source into target.
     """
     p, q = _matches(p, q)
     radius = _radius(inlier_radius)
     scale = .04 / radius
     candidates = bank(p * scale, q * scale)
-    index = int(candidates["scores"].argmax())
-    return {"R": candidates["rotation"][index].copy(),
-            "t": candidates["translation"][index].copy() / scale}
+    i = int(candidates["scores"].argmax())
+    return dict(R=candidates["rotation"][i].copy(),
+                t=candidates["translation"][i].copy() / scale)
+
+
+def _finish(p, q, source, target, candidates, radius, budget):
+    factor = .1 / radius
+    native = candidates["native"]
+    result = process(
+        p * factor, q * factor, source * factor, target * factor,
+        candidates["R"], candidates["t"] * factor,
+        dict(valid=True, R=native["R"], t=native["t"] * factor),
+        candidates["aux_R"], candidates["aux_t"] * factor, maximum=budget)
+    i = result["index"]
+    if i is None:
+        raise ValueError("No valid surface alignment")
+    return dict(R=result["bank"]["refined_R"][i].copy(),
+                t=result["bank"]["refined_t"][i].copy() / factor,
+                refinement_count=result["refinement_count"])
+
+
+def refine_candidates(p, q, source_surface, target_surface,
+                      rotations, translations, native_pose, *,
+                      auxiliary=None, inlier_radius=.1, budget=32):
+    """Allocate surface refinements and select a pose from an external pool.
+
+    rotations and translations have shapes (K, 3, 3) and (K, 3).
+    native_pose contains a proper rotation R and translation t and is retained
+    in the primary shortlist. auxiliary optionally supplies another (R, t)
+    pool for the extra refinement queue. All translations and point arrays
+    use the input physical unit. Invalid raw candidate poses are discarded;
+    a malformed pool or invalid native pose raises ValueError.
+
+    Return R, t and refinement_count (candidate attempts, each with up to
+    two ICP scales). No learned parameters or inlier labels are required.
+    """
+    p, q = _matches(p, q)
+    radius, budget = _radius(inlier_radius), _budget(budget)
+    rotations, translations = _poses(rotations, translations)
+    try:
+        native_R = np.asarray(native_pose["R"], dtype=np.float64)
+        native_t = np.asarray(native_pose["t"], dtype=np.float64)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("native_pose must contain R and t arrays") from error
+    if (native_R.shape != (3, 3) or native_t.shape != (3,)
+            or not legal(native_R[None], native_t[None])[0]):
+        raise ValueError("native_pose must be a finite proper rigid transformation")
+    if auxiliary is None:
+        aux_R, aux_t = np.empty((0, 3, 3)), np.empty((0, 3))
+    else:
+        aux_R, aux_t = _poses(*auxiliary)
+    source, target = (_prepare_surface(points, radius)
+                      for points in (source_surface, target_surface))
+    candidates = dict(R=rotations, t=translations, native=dict(R=native_R, t=native_t),
+                      aux_R=aux_R, aux_t=aux_t)
+    return _finish(p, q, source, target, candidates, radius, budget)
 
 
 def register_with_surfaces(p, q, source_surface, target_surface, *,
-                           inlier_radius=.1, budget=16):
-    """Estimate a pose using correspondences and observed source/target surfaces.
+                           inlier_radius=.1, budget=32):
+    """Run motif generation, retained growth, surface finishing and release.
 
-    Surfaces are finite (L, 3) observation arrays in the same unit as p and q.
-    Each is reduced to its first observation per voxel of side .5*inlier_radius.
-    Use radius .1 for metre-scale indoor data and .6 for metre-scale outdoor
-    driving data. budget caps candidate-refinement attempts at 16 or 32. Each
-    attempt uses up to two ICP capture radii. The
-    returned translation uses input units; no labels or reference pose are used.
+    Surfaces and correspondences use the same physical unit. At most budget
+    candidates are refined. Each surface retains its first observation in
+    each voxel of side .5*inlier_radius, preserving observation order.
     """
     p, q = _matches(p, q)
-    radius = _radius(inlier_radius)
-    if not isinstance(budget, (int, np.integer)) or budget not in (16, 32):
-        raise ValueError("budget must be 16 or 32")
-    budget = int(budget)
-    factor = .1 / radius
-    source, target = (_prepare_surface(points, radius) * factor
+    radius, budget = _radius(inlier_radius), _budget(budget)
+    source, target = (_prepare_surface(points, radius)
                       for points in (source_surface, target_surface))
-    candidates = _candidates(p, q, radius)
-    result = process(p * factor, q * factor, source, target,
-                     candidates["R"], candidates["t"], candidates["native"],
-                     candidates["aux_R"], candidates["aux_t"], maximum=budget)
-    pose = result["outcomes"][str(budget)]
-    if not pose["valid"]:
-        raise ValueError("No valid retained surface alignment")
-    return {"R": np.asarray(pose["R"]).copy(),
-            "t": np.asarray(pose["t"]).copy() / factor}
+    front = _candidates(p, q, radius)
+    return _finish(p, q, source, target, front, radius, budget)

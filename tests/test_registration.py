@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from ngr import register_correspondences, register_with_surfaces
+from ngr import refine_candidates, register_correspondences, register_with_surfaces
 from ngr import registration as api
 from ngr import _surface as surface
 from ngr._core import bank
@@ -90,7 +90,7 @@ def test_direct_pose_role_and_translation_scaling(monkeypatch, order):
         return raw_R.copy(), raw_t * 2
     monkeypatch.setattr(api, "seed_poses", direct)
     candidates = api._candidates(p, q, .6)
-    expected = (raw_t / (.04 / .6)) * (.1 / .6)
+    expected = raw_t / (.04 / .6)
     np.testing.assert_array_equal(candidates["t"], expected)
     np.testing.assert_array_equal(candidates["native"]["t"], expected[0])
     assert len(candidates["R"]) == 1
@@ -98,7 +98,7 @@ def test_direct_pose_role_and_translation_scaling(monkeypatch, order):
     assert len(calls) == (1 if order == 3 else 0)
     if order == 3:
         np.testing.assert_array_equal(candidates["aux_t"],
-                                      ((raw_t * 2) / (.04 / .6)) * (.1 / .6))
+                                      (raw_t * 2) / (.04 / .6))
 
 
 def test_global_budget_uses_nested_extra_queue(monkeypatch):
@@ -107,6 +107,8 @@ def test_global_budget_uses_nested_extra_queue(monkeypatch):
             pass
         def score(self, R, t, information=False, early=False):
             return 1 + t[:, 0]
+        def moments(self, R, t):
+            return np.ones((len(R), 2), dtype=np.int64), np.full((len(R), 2), .001)
     class ICP:
         def __init__(self, source, target):
             pass
@@ -122,20 +124,13 @@ def test_global_budget_uses_nested_extra_queue(monkeypatch):
     native = dict(valid=True, R=R[0], t=t[0])
     small = surface.process(p, q, p, q, R, t, native, aux_R, aux_t, maximum=16)
     large = surface.process(p, q, p, q, R, t, native, aux_R, aux_t, maximum=32)
-    assert small["retained_calls"] == large["retained_calls"] == 1
-    assert small["total_calls"] == small["fresh_ICP_calls"] == 16
-    assert large["total_calls"] == large["fresh_ICP_calls"] == 17
+    assert small["primary_count"] == large["primary_count"] == 1
+    assert small["refinement_count"] == 16
+    assert large["refinement_count"] == 17
     np.testing.assert_array_equal(small["bank"]["extra_initial_t"],
                                   large["bank"]["extra_initial_t"][:15])
     np.testing.assert_array_equal(small["bank"]["refined_t"],
                                   large["bank"]["refined_t"][:16])
-    assert small["indices"]["16"] == large["indices"]["16"]
-
-
-def test_invalid_primary_pool_keeps_invalid_output():
-    post = dict(valid=np.array([False, True]), refined_M=np.ones(2),
-                refined_G=np.ones(2))
-    assert surface.choose(post, np.ones(2), keep=1, budget=32) is None
 
 
 @pytest.mark.parametrize("p,q", [(np.zeros((2, 3)), np.zeros((2, 3))),
@@ -163,3 +158,79 @@ def test_surfaces_must_retain_six_observations():
     p, q, _, _ = points()
     with pytest.raises(ValueError, match="six retained"):
         register_with_surfaces(p, q, np.zeros((20, 3)), q)
+
+
+def test_capacity_handles_fewer_pairs_than_the_shortlist_budget():
+    p, q, R, t = points()
+    pose = register_correspondences(p[:4], q[:4])
+    np.testing.assert_allclose(pose["R"], R, atol=1e-6)
+    np.testing.assert_allclose(pose["t"], t, atol=1e-6)
+
+
+def test_release_uses_both_evidence_channels():
+    support = np.array([1., .1, .7])
+    normalized_mean = np.array([.4, .001, .005])
+    hits = np.full((3, 2), 10, dtype=np.int64)
+    squared = normalized_mean[:, None] * hits * .1**2
+    assert surface.release_index(support, hits, squared) == 2
+
+
+@pytest.mark.parametrize("support,hits,squared,expected", [
+    ([.2, .8], [[0, 0], [0, 0]], [[0., 0.], [0., 0.]], 1),
+    ([.2, .8], [[2, 2], [2, 2]], [[0., 0.], [.001, .001]], 0),
+    ([0., 0.], [[2, 2], [2, 2]], [[.002, .002], [.0001, .0001]], 1),
+    ([1., 1.], [[2, 2], [2, 2]], [[.001, .001], [.001, .001]], 0),
+])
+def test_release_handles_empty_exact_and_tied_evidence(support, hits, squared, expected):
+    assert surface.release_index(np.array(support), np.array(hits),
+                                 np.array(squared)) == expected
+
+
+@pytest.mark.parametrize("unit", [1., 1000.])
+def test_external_candidate_pool_can_recover_a_wrong_native_winner(unit):
+    pytest.importorskip("open3d")
+    p, q, R, t = points()
+    p, q, t = p*unit, q*unit, t*unit
+    rotations = np.stack((R, R))
+    translations = np.stack((t+4*unit, t))
+    original = translations.copy()
+    pose = refine_candidates(
+        p, q, p, q, rotations, translations,
+        dict(R=R, t=translations[0]), inlier_radius=.1*unit)
+    np.testing.assert_allclose(pose["R"], R, atol=1e-6)
+    np.testing.assert_allclose(pose["t"], t, atol=1e-6*unit)
+    assert 1 <= pose["refinement_count"] <= 32
+    np.testing.assert_array_equal(translations, original)
+
+
+def test_invalid_native_pose_is_rejected_before_refinement():
+    p, q, _, _ = points()
+    with pytest.raises(ValueError, match="native_pose"):
+        refine_candidates(p, q, p, q, np.eye(3)[None], np.zeros((1, 3)),
+                          dict(R=2*np.eye(3), t=np.zeros(3)))
+
+
+def test_invalid_primary_refinement_can_release_valid_auxiliary(monkeypatch):
+    class Evidence:
+        def __init__(self, source, target):
+            pass
+        def score(self, R, t, information=False, early=False):
+            return 1 + t[:, 0]
+        def moments(self, R, t):
+            return np.ones((len(R), 2), dtype=np.int64), np.full((len(R), 2), .001)
+    class ICP:
+        def __init__(self, source, target):
+            pass
+        def apply(self, pose):
+            return dict(pose, valid=not np.allclose(pose["t"], 0)), []
+    monkeypatch.setattr(surface, "Evidence", Evidence)
+    monkeypatch.setattr(surface, "SurfaceICP", ICP)
+    monkeypatch.setattr(surface, "mae", lambda p, q, R, t: 100-t[:, 0])
+    p, q, _, _ = points()
+    R = np.eye(3)[None]
+    t = np.zeros((1, 3))
+    out = surface.process(p, q, p, q, R, t, dict(valid=True, R=R[0], t=t[0]),
+                          R, np.array([[.3, 0, 0]]), maximum=32)
+    assert out["primary_count"] == 1
+    assert not out["bank"]["valid"][0]
+    assert out["index"] == 1

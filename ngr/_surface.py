@@ -1,5 +1,4 @@
-"""Observed-surface evidence, candidate selection and point-to-plane ICP."""
-from time import perf_counter
+"""Budgeted surface refinement, geometric evidence and complementary release."""
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -171,6 +170,23 @@ class Evidence:
         if self.sw is None:
             self.sw, self.tw = query_weights(self.sq), query_weights(self.tq)
 
+    def moments(self, rotations, translations):
+        """Counts and squared distances below the radius in both directions."""
+        hits = np.zeros((len(rotations), 2), dtype=np.int64)
+        squared = np.zeros((len(rotations), 2))
+        for i, (rotation, translation) in enumerate(zip(rotations, translations)):
+            forward = self.target_tree.query(
+                self.sq @ rotation.T + translation, distance_upper_bound=.1,
+                workers=1)[0]
+            reverse = self.source_tree.query(
+                (self.tq - translation) @ rotation, distance_upper_bound=.1,
+                workers=1)[0]
+            for j, distance in enumerate((forward, reverse)):
+                inside = distance[distance < .1]
+                hits[i, j] = len(inside)
+                squared[i, j] = float(np.sum(inside**2))
+        return hits, squared
+
     def score(self, R, t, information=False, early=False):
         if information:
             self.weights()
@@ -190,82 +206,126 @@ class Evidence:
         return np.concatenate(scores) if scores else np.empty(0)
 
 
-def empty_pose():
-    return dict(valid=False,R=None,t=None)
+def concentration_score(mean_squared_radius):
+    """One-sided concentration rate for normalized squared surface distances."""
+    q = np.asarray(mean_squared_radius, dtype=np.float64)
+    score = np.zeros_like(q)
+    score[q <= 0] = np.inf
+    inside = (q > 0) & (q < .5)
+    if inside.any():
+        target = q[inside]
+        lo, hi = np.zeros_like(target), 1 / target
+        for _ in range(100):
+            mid = (lo + hi) / 2
+            small = mid < 1e-3
+            with np.errstate(over="ignore"):
+                mean = np.where(small, .5 - mid/12 + mid**3/720,
+                                1/np.where(small, 1., mid)
+                                - 1/np.expm1(np.where(small, 1., mid)))
+            larger = mean > target
+            lo = np.where(larger, mid, lo)
+            hi = np.where(larger, hi, mid)
+        tilt = (lo + hi) / 2
+        score[inside] = -tilt*target - (np.log(-np.expm1(-tilt)) - np.log(tilt))
+    return score
 
 
-def pose_at(post, index):
-    if index is None or not post['valid'][index]:
-        return empty_pose()
-    return dict(valid=True,R=post['refined_R'][index].tolist(),t=post['refined_t'][index].tolist())
+def release_index(support, hits, squared_distances):
+    """Select by the weaker normalized support and residual-concentration score."""
+    support = np.asarray(support, dtype=np.float64)
+    hits = np.asarray(hits)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mean = squared_distances / (hits * .1**2)
+    evidence = concentration_score(np.where(hits > 0, mean, 1.)).mean(1)
+    evidence[(hits == 0).any(1)] = -np.inf
+    if np.isneginf(evidence).all():
+        return int(np.argmax(support))
+    if np.isposinf(evidence).any():
+        shape = np.isposinf(evidence).astype(float)
+    else:
+        shape = np.exp(evidence - evidence.max())
+    if support.max() <= 0:
+        return int(np.argmax(shape))
+    support = support / support.max()
+    score = np.minimum(support, shape)
+    return int(np.lexsort((-np.arange(len(score)), shape, support, score))[-1])
 
 
-def choose(post, information, keep, budget):
-    stop=min(budget,len(post['valid']));retained=np.flatnonzero(post['valid'][:min(keep,stop)])
-    if not len(retained):return None
-    M,G=post['refined_M'],post['refined_G'];anchor=int(retained[np.argmax(M[retained]*np.sqrt(G[retained]))])
-    score=M[:stop]*np.sqrt(information[:stop])
-    permitted=np.flatnonzero(post['valid'][:stop]&(information[:stop]>=information[anchor])&(score>score[anchor]))
-    return int(permitted[np.argmax(score[permitted])]) if len(permitted) else anchor
+def process(p, q, source, target, raw_R, raw_t, native,
+            aux_R=None, aux_t=None, maximum=32):
+    """Allocate a refinement queue and release a pose; coordinates use radius .1."""
+    if maximum not in (16, 32):
+        raise ValueError("Budget must be 16 or 32")
+    if not native.get("valid", False):
+        raise ValueError("A valid native pose is required")
+    R, t = np.asarray(raw_R, dtype=np.float64), np.asarray(raw_t, dtype=np.float64)
+    if aux_R is None:
+        aux_R, aux_t = np.empty((0, 3, 3)), np.empty((0, 3))
+    initial = shortlist(p, q, R, t, np.asarray(native["R"]), np.asarray(native["t"]))
+    evidence = Evidence(source, target)
+    backend = SurfaceICP(source, target)
 
+    def refine(rotations, translations):
+        fitted_R = np.zeros_like(rotations)
+        fitted_t = np.zeros_like(translations)
+        valid = np.zeros(len(rotations), dtype=bool)
+        for i in range(len(rotations)):
+            pose, _ = backend.apply(dict(valid=True, R=rotations[i], t=translations[i]))
+            if pose["valid"]:
+                fitted_R[i], fitted_t[i], valid[i] = pose["R"], pose["t"], True
+        M, G = np.zeros(len(rotations)), np.zeros(len(rotations))
+        if valid.any():
+            M[valid] = mae(p, q, fitted_R[valid], fitted_t[valid])
+            G[valid] = evidence.score(fitted_R[valid], fitted_t[valid])
+        return dict(refined_R=fitted_R, refined_t=fitted_t,
+                    refined_M=M, refined_G=G, valid=valid)
 
-def process(p,q,source,target,raw_R,raw_t,native,aux_R=None,aux_t=None,maximum=32):
-    if maximum not in (16,32):raise ValueError('Budgets must be 16 or 32')
-    began=perf_counter();timing={};reuse=0;fresh=0;stages=[]
-    R,t=np.asarray(raw_R,dtype=np.float64),np.asarray(raw_t,dtype=np.float64)
-    if not native.get('valid',False):return dict(outcomes={'ICP1':empty_pose(),'16':empty_pose(),'32':empty_pose()},status='no_native_pose',seconds=perf_counter()-began)
-    if aux_R is None:aux_R,aux_t=np.empty((0,3,3)),np.empty((0,3))
-    initial=shortlist(p,q,R,t,np.asarray(native['R']),np.asarray(native['t']))
-    evidence=Evidence(source,target);backend=None
-    def polish(r,translation):
-        nonlocal backend,reuse,fresh
-        M=mae(p,q,r,translation);G=evidence.score(r,translation);parents=allocation(M,G)
-        if backend is None:backend=SurfaceICP(source,target)
-        fit_R=np.zeros((len(parents),3,3));fit_t=np.zeros((len(parents),3));valid=np.zeros(len(parents),dtype=bool)
-        for index,parent in enumerate(parents):
-            prediction,trace=backend.apply(dict(valid=True,R=r[parent],t=translation[parent]));fresh+=1;stages.append(trace)
-            if prediction['valid']:fit_R[index],fit_t[index],valid[index]=prediction['R'],prediction['t'],True
-        post_M,post_G=np.zeros(len(parents)),np.zeros(len(parents))
-        if valid.any():post_M[valid]=mae(p,q,fit_R[valid],fit_t[valid]);post_G[valid]=evidence.score(fit_R[valid],fit_t[valid])
-        return dict(R=r,t=translation,parents=parents,refined_R=fit_R,refined_t=fit_t,refined_M=post_M,refined_G=post_G,valid=valid)
-    base=polish(initial['R'],initial['t']);keep=len(base['parents']);timing['base_seconds']=perf_counter()-began;mark=perf_counter()
-    raw_ids=np.empty(0,dtype=int);extra_order=np.empty(0,dtype=int);screened=0;skyline_count=0
-    if maximum>keep:
-        proposals_R=np.concatenate((R,aux_R));proposals_t=np.concatenate((t,aux_t))
-        valid=legal(proposals_R,proposals_t);raw_ids=np.flatnonzero(valid);proposals_R,proposals_t=proposals_R[valid],proposals_t[valid]
-        M=mae(p,q,proposals_R,proposals_t);I=evidence.score(proposals_R,proposals_t,information=True,early=True);screened=len(M)
-        parents=base['parents'];unused=distinct(proposals_R,proposals_t,np.argsort(-I,kind='stable'),base['R'][parents],base['t'][parents],maximum=len(proposals_R))
-        skyline=unused[frontier(M[unused],I[unused])];skyline_count=len(skyline)
-        selected=skyline[np.argsort(-I[skyline],kind='stable')[:16]]
-        # The complete extra queue is ranked before cutting the global budget.
-        # This makes B16 and B32 genuine nested caps even when keep<16.
+    M = mae(p, q, initial["R"], initial["t"])
+    G = evidence.score(initial["R"], initial["t"])
+    parents = allocation(M, G)
+    base = refine(initial["R"][parents], initial["t"][parents])
+    primary_count = len(parents)
+    extra_R, extra_t = np.empty((0, 3, 3)), np.empty((0, 3))
+    selected_raw_indices = np.empty(0, dtype=int)
+    if maximum > primary_count:
+        proposal_R = np.concatenate((R, aux_R))
+        proposal_t = np.concatenate((t, aux_t))
+        ids = np.flatnonzero(legal(proposal_R, proposal_t))
+        proposal_R, proposal_t = proposal_R[ids], proposal_t[ids]
+        M = mae(p, q, proposal_R, proposal_t)
+        I = evidence.score(proposal_R, proposal_t, information=True, early=True)
+        unused = distinct(proposal_R, proposal_t, np.argsort(-I, kind="stable"),
+                          initial["R"][parents], initial["t"][parents],
+                          maximum=len(proposal_R))
+        skyline = unused[frontier(M[unused], I[unused])]
+        selected = skyline[np.argsort(-I[skyline], kind="stable")[:16]]
         if len(selected):
-            extra_R,extra_t=proposals_R[selected],proposals_t[selected]
-            extra_M=mae(p,q,extra_R,extra_t);extra_G=evidence.score(extra_R,extra_t);order=allocation(extra_M,extra_G)
-            extra_order=order[:max(0,maximum-keep)];extra_R,extra_t=extra_R[extra_order],extra_t[extra_order]
-            extra_order=raw_ids[selected[extra_order]]
-        else:extra_R,extra_t=np.empty((0,3,3)),np.empty((0,3))
-    else:extra_R,extra_t=np.empty((0,3,3)),np.empty((0,3))
-    timing['screen_seconds']=perf_counter()-mark;mark=perf_counter()
+            extra_R, extra_t = proposal_R[selected], proposal_t[selected]
+            extra_M = mae(p, q, extra_R, extra_t)
+            extra_G = evidence.score(extra_R, extra_t)
+            queue = allocation(extra_M, extra_G)[:maximum - primary_count]
+            extra_R, extra_t = extra_R[queue], extra_t[queue]
+            selected_raw_indices = ids[selected[queue]]
+
     if len(extra_R):
-        # The queue already carries allocation order. Preserve it while fitting.
-        if backend is None:backend=SurfaceICP(source,target)
-        fit_R=np.zeros_like(extra_R);fit_t=np.zeros_like(extra_t);valid=np.zeros(len(extra_R),dtype=bool)
-        for index in range(len(extra_R)):
-            pred,trace=backend.apply(dict(valid=True,R=extra_R[index],t=extra_t[index]));fresh+=1;stages.append(trace)
-            if pred['valid']:fit_R[index],fit_t[index],valid[index]=pred['R'],pred['t'],True
-        M,G=np.zeros(len(extra_R)),np.zeros(len(extra_R))
-        if valid.any():M[valid]=mae(p,q,fit_R[valid],fit_t[valid]);G[valid]=evidence.score(fit_R[valid],fit_t[valid])
-        extra=dict(refined_R=fit_R,refined_t=fit_t,refined_M=M,refined_G=G,valid=valid)
-        post={key:np.concatenate((base[key],extra[key])) for key in ('refined_R','refined_t','refined_M','refined_G','valid')}
-    else:post={key:base[key].copy() for key in ('refined_R','refined_t','refined_M','refined_G','valid')}
-    timing['extra_ICP_seconds']=perf_counter()-mark;mark=perf_counter()
-    information=evidence.score(post['refined_R'],post['refined_t'],information=True)
-    outcomes={'ICP1':pose_at(base,0)};indices={}
-    for budget in (16,32):
-        if budget>maximum:continue
-        indices[str(budget)]=choose(post,information,keep,budget);outcomes[str(budget)]=pose_at(post,indices[str(budget)])
-    timing['readout_seconds']=perf_counter()-mark
-    post.update(information_G=information,retained_ICP_count=np.array(keep),extra_initial_R=extra_R,extra_initial_t=extra_t,selected_raw_indices=extra_order)
-    return dict(outcomes=outcomes,indices=indices,status='complete',bank=post,screened=screened,skyline_modes=skyline_count,retained_calls=keep,total_calls=len(post['valid']),
-        fresh_ICP_calls=fresh,reused_ICP_calls=reuse,ICP_stages=stages,timing=timing,seconds=perf_counter()-began)
+        extra = refine(extra_R, extra_t)
+        post = {key: np.concatenate((base[key], extra[key])) for key in base}
+    else:
+        post = {key: value.copy() for key, value in base.items()}
+    ids = np.flatnonzero(post["valid"])
+    information = np.zeros(len(post["valid"]))
+    hit_counts = np.zeros((len(post["valid"]), 2), dtype=np.int64)
+    squared = np.zeros((len(post["valid"]), 2))
+    index = None
+    if len(ids):
+        information[ids] = evidence.score(post["refined_R"][ids],
+                                           post["refined_t"][ids], information=True)
+        hit_counts[ids], squared[ids] = evidence.moments(post["refined_R"][ids],
+                                                       post["refined_t"][ids])
+        support = post["refined_M"][ids] * np.sqrt(information[ids])
+        index = int(ids[release_index(support, hit_counts[ids], squared[ids])])
+    post.update(information_G=information, moment_counts=hit_counts,
+                moment_squared=squared, extra_initial_R=extra_R, extra_initial_t=extra_t,
+                selected_raw_indices=selected_raw_indices)
+    return dict(index=index, bank=post, primary_count=primary_count,
+                refinement_count=len(post["valid"]))

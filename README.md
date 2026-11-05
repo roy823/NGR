@@ -1,90 +1,98 @@
 # NGR: Nucleate, Grow, Refine
 
-NGR estimates a rigid transformation from tentative 3D correspondences. Its
-crystallization-inspired nuclei initialize correspondence phases, and a
-total-reflux-inspired update retains each phase's current composition during
-multiplicative enrichment. Weighted rigid fitting produces candidate poses.
-The CPU estimator does not require training; phase weights are inference states.
+NGR is a training-free CPU reference implementation for rigid 3D registration.
+Its capacity-aware NGR-LS generator preserves alternative correspondence phases,
+retained-composition growth enriches their support, and weighted fitting
+produces pose hypotheses. Surface finishing allocates a bounded refinement
+budget; complementary release selects the final pose using geometric support
+and residual concentration.
 
-The complete surface-assisted method includes a reusable registration
-postprocessor: geometric hypothesis screening, two-scale ICP, and
-geometry-informed readout under a fixed candidate budget. The correspondence-only
-interface provides registration when observed surfaces are unavailable.
+The implementation uses NumPy, SciPy and PyTorch for array operations, with
+Open3D for point-to-plane ICP.
 
 ## Installation
 
 Use Python 3.11:
 
-```bash
-pip install .
-```
+    pip install .
 
-For complete surface-assisted registration:
+For observed-surface registration:
 
-```bash
-pip install ".[surface]"
-```
+    pip install ".[surface]"
+
+## Complete registration
+
+    from ngr import register_with_surfaces
+
+    pose = register_with_surfaces(
+        p, q, source_points, target_points,
+        inlier_radius=0.1, budget=32,
+    )
+    aligned = source_points @ pose["R"].T + pose["t"]
+    attempts = pose["refinement_count"]
+
+The matched arrays p and q have shape (N, 3), with N at least three.
+Surface arrays contain the observed source and target points. All coordinates,
+translations and the positive inlier radius use the same physical unit.
+
+The returned R has shape (3, 3), and t has shape (3,). They map source into
+target. Surface preparation keeps the first observation in each voxel of side
+0.5 times the radius, preserving input order; each surface must retain at least
+six observations. Each refinement attempt uses two ICP scales, with at most
+ten iterations per scale.
+
+The default budget is 32; a budget of 16 uses the corresponding nested queue
+prefix. The budget caps attempts, and refinement_count reports actual use.
+If no valid refined pose exists, registration raises ValueError.
+
+## Reuse the verifier with another generator
+
+    from ngr import refine_candidates
+
+    pose = refine_candidates(
+        p, q, source_points, target_points,
+        candidate_rotations, candidate_translations,
+        native_pose={"R": native_rotation, "t": native_translation},
+        inlier_radius=0.1, budget=32,
+    )
+
+Candidate rotations and translations have shapes (K, 3, 3) and (K, 3).
+The native pose is the generator's own output, including its native refinement,
+and is retained in the primary shortlist. Invalid raw rigid poses are
+discarded; the native pose itself must be valid.
+
+An optional auxiliary argument supplies a pair of rotation and translation
+arrays for the additional refinement queue. All candidate translations use
+the input coordinate unit. The complete NGR interface automatically supplies
+direct triple-nucleus fits as auxiliary proposals; pair nuclei supply grown
+poses only.
 
 ## Correspondences only
 
-```python
-from ngr import register_correspondences
+    from ngr import register_correspondences
 
-pose = register_correspondences(p, q, inlier_radius=0.04)
-aligned = p @ pose["R"].T + pose["t"]
-```
+    pose = register_correspondences(p, q, inlier_radius=0.04)
 
-`p` and `q` are matched finite NumPy arrays of shape `(N, 3)`, with `N >= 3`.
-Coordinates and `inlier_radius` must use the same physical unit. The returned
-translation uses that unit, and the pose maps source points into the target
-frame. The native radius is `0.04`; setting another radius scales the complete
-correspondence estimator, including its compatibility kernel and refitting.
-If no admissible nondegenerate nucleus is available, registration raises
-`ValueError`. Triangle ranking uses support from additional correspondences;
-exactly three mutually consistent matches can leave that ranking empty.
-
-## Correspondences with observed surfaces
-
-```python
-from ngr import register_with_surfaces
-
-pose = register_with_surfaces(
-    p, q, source_points, target_points, inlier_radius=0.1, budget=16,
-)
-```
-
-All four point arrays use the same coordinate frame conventions and unit. Supply
-raw observed surfaces; surface preparation is performed inside this interface.
-For coordinates in metres, use radius `0.1` for indoor scans or `0.6` for outdoor
-driving scans. The function keeps the first observation in each voxel of side
-`0.5 * inlier_radius`, preserving input order. Supply observed point arrays with
-at least six retained points and nonzero extent.
-
-The surface interface supports both pair and triple nuclei. Grown poses form the
-primary candidate pool. Direct fits of triple nuclei supplement the auxiliary
-pool; pair nuclei supply grown poses only. Surface evidence selects a queue for
-point-to-plane ICP and a guarded information-weighted final readout.
-
-The default `budget=16` and optional `budget=32` cap candidate-refinement attempts
-on nested queues. Each attempt uses up to two ICP capture radii, with at most ten
-iterations per radius. The native winner is retained as the first candidate;
-surface verification selects the final output from the refined candidates.
-If every primary surface refinement is invalid, the function raises `ValueError`.
+This interface uses the capacity-aware generator and its native residual
+readout. The radius scales the compatibility kernel and correspondence refits
+together. Seeding requires admissible geometric support; if no nondegenerate
+nucleus exists, registration raises ValueError. Exactly three mutually
+consistent matches can leave the triple ranking empty because its score
+requires additional graph support.
 
 ## Implementation
 
-- `ngr/_core.py`: compatibility graph, motif ranking, initialization and growth.
-- `ngr/_rigid.py`: weighted rigid fitting and correspondence refitting.
-- `ngr/_surface.py`: surface support, information weights, mode selection and ICP.
-- `ngr/registration.py`: correspondence and observed-surface interfaces.
+- ngr/_core.py: compatibility, capacity-aware motif selection and phase growth.
+- ngr/_rigid.py: weighted rigid fits and correspondence refitting.
+- ngr/_surface.py: candidate allocation, ICP, surface evidence and release.
+- ngr/registration.py: unit-aware registration and candidate-pool interfaces.
 
-Equations, scaling and inference steps are described in [the method](docs/method.md).
+[Method details](docs/method.md) describe the equations, numerical conventions
+and coordinate scaling.
 
 ## Tests
 
-```bash
-pip install ".[surface,test]"
-python -m pytest
-```
+    pip install ".[surface,test]"
+    python -m pytest
 
 Author: Chengrui Xu.

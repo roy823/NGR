@@ -1,9 +1,46 @@
 """Geometric compatibility, motif initialization and phase growth."""
+import heapq
 import numpy as np
 import torch
 from scipy.linalg.blas import ssyrk
 from scipy.spatial.distance import pdist,squareform
 from . import _rigid as reference
+
+
+def capacity_greedy(items, affinity, count, capacity, occupied):
+    """Select motifs by affinity times the vacancies of their occupied sites."""
+    used = {}
+    excluded = set(occupied)
+    for i in excluded:
+        for x in items[i]:
+            used[int(x)] = used.get(int(x), 0) + 1
+    heap = [(-float(value), i) for i, value in enumerate(affinity)
+            if i not in excluded]
+    heapq.heapify(heap)
+    selected = []
+    while heap and len(selected) < count:
+        negative, i = heapq.heappop(heap)
+        value = float(affinity[i]) * np.prod(
+            [1 / (1 + used.get(int(x), 0) / capacity) for x in items[i]])
+        if value < -negative - 1e-15:
+            heapq.heappush(heap, (-value, i))
+            continue
+        selected.append(i)
+        for x in items[i]:
+            used[int(x)] = used.get(int(x), 0) + 1
+    return selected
+
+
+def capacity_pairs(graph, square, count):
+    available = len(graph) * (len(graph) - 1) // 2
+    count = min(count, available)
+    wide = pair_shortlist(graph, square, min(65536, available))
+    a, b = wide.numpy()
+    affinity = (graph[wide[0], wide[1]] * square[wide[0], wide[1]]).numpy()
+    head = list(range(count // 2))
+    tail = capacity_greedy(np.stack((a, b), 1), affinity,
+                           count - len(head), 8, head)
+    return wide[:, torch.as_tensor(head + tail, dtype=torch.long)]
 
 def pair_shortlist(graph, square, count=4096):
     a, b = torch.triu_indices(len(graph), len(graph), 1)
@@ -79,14 +116,18 @@ def triplets(graph, source_edges, target_edges, pairs):
     triples = np.concatenate([b[0] for b in buffers])
     values = np.concatenate([b[1] for b in buffers])
     _, first = np.unique(np.sort(triples, axis=1), axis=0, return_index=True)
-    return triples[first[np.argsort(-values[first], kind='stable')[:1024]]]
+    order = first[np.argsort(-values[first], kind='stable')[:16384]]
+    deep, affinity = triples[order], values[order]
+    head = list(range(min(512, len(deep))))
+    tail = capacity_greedy(deep, affinity, 1024 - len(head), 4, head)
+    return deep[np.asarray(head + tail, dtype=np.int64)]
 
 @torch.inference_mode()
 def bank(p,q):
     p,q=(torch.as_tensor(x,dtype=torch.float64) for x in (p,q))
     graph,left,right,load=distance_graph(p,q)
     upper=torch.from_numpy(ssyrk(1.,graph.numpy().T,trans=1,lower=0))
-    pairs=pair_shortlist(graph,upper,256 if load<1 else 4096)
+    pairs=capacity_pairs(graph,upper,256 if load<1 else 4096)
     del upper
     if load<1:
         seeds=pairs.T.numpy();initial=nuclei(graph,*pairs);mode='count'

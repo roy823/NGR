@@ -1,106 +1,163 @@
 # Inference method
 
-For correspondences `(p_i, q_i)`, NGR seeks a proper rotation `R` and translation
-`t` such that `q_i` is close to `R p_i + t` for a coherent subset.
+For tentative correspondences (p_i, q_i), NGR estimates a proper rigid motion
+(R, t). The generator and the surface verifier are separate components; the
+verifier also accepts candidate poses from another generator. Phase weights
+are inference states, with no training required.
 
-## Compatibility and nuclei
+## Compatibility and motif budgets
 
-The off-diagonal graph entries are
+The graph is zero-diagonal, with
 
-$$\Lambda_{ij}=\exp\left[-\frac{(\|p_i-p_j\|-\|q_i-q_j\|)^2}{2\sigma_c^2}\right],
-\qquad \Lambda_{ii}=0.$$
+$$
+\Lambda_{ij}=\exp\!\left[
+-\frac{(\|p_i-p_j\|-\|q_i-q_j\|)^2}{2\sigma_c^2}
+\right], \qquad i\ne j.
+$$
 
-The native-unit kernel width is `sigma_c = 0.015`. Pair scores combine direct
-compatibility with second-order support:
+In internal generator units, sigma_c = 0.015. Let lambda_bar be the mean
+off-diagonal compatibility. The load (N - 2) times lambda_bar squared chooses
+256 pair nuclei when below one, or a shortlist of 4096 pivot pairs leading to
+at most 1024 triple nuclei otherwise. Requested counts are bounded by the
+number of available motifs.
+
+Pair affinity is
 
 $$P_{ab}=\Lambda_{ab}(\Lambda^2)_{ab}.$$
 
-Let `lambda_bar` be the mean off-diagonal compatibility. The observable load
-`B2 = (N - 2) * lambda_bar**2` determines the motif order. Below one, NGR retains
-up to 256 pairs. Otherwise, it ranks up to 4096 pivot pairs and evaluates all
-third nodes with the weighted four-node score
+A deeper ranking retains at most 65536 pairs. Half the pair budget keeps the
+original affinity ranking. The remainder is selected greedily with a
+cumulative vacancy for each correspondence x:
 
-$$T_{abc}=\Lambda_{ab}\Lambda_{ac}\Lambda_{bc}
-            \sum_d\Lambda_{ad}\Lambda_{bd}\Lambda_{cd}.$$
+$$
+\theta_x=(1+n_x/q)^{-1},\qquad
+\widetilde P_{ab}=P_{ab}\theta_a\theta_b,
+$$
 
-Source and target triangles must have singular-value ratio at least `0.1`.
-Blockwise ranking and deduplication retain at most 1024 triples. Phase weights
-start from the product of anchor compatibility rows, with a unit contribution at
-each anchor, followed by normalization.
+where n_x counts the selected motifs containing x and q = 8 for pairs.
 
-## State-retaining growth
+Triple affinity is
 
-Crystallization-inspired motifs provide the initial composition of each phase.
-The total-reflux-inspired update retains that composition as it evolves. Phases
-evolve independently through ten sequential updates:
+$$
+T_{abc}=\Lambda_{ab}\Lambda_{ac}\Lambda_{bc}
+        \sum_d\Lambda_{ad}\Lambda_{bd}\Lambda_{cd}.
+$$
 
-$$w_i^+\propto(w_i+10^{-30})\,[1+N(\Lambda w)_i]^2.$$
+Both source and target triangles must have singular-value ratio at least 0.1.
+Each block of 256 pivots contributes at most 3072 scored triples.
+Deduplication and ranking retain up to 16384 candidates. Up to 512 nuclei keep
+their affinity order; the remainder of the 1024 budget uses
+T_abc times theta_a theta_b theta_c, with q = 4. These vacancies discount
+repeated match occupancy without imposing a hard exclusion.
 
-The current composition remains the multiplicative base. Compatibility matrices
-and growth use single precision; distances, triangle geometry, rigid fitting and
-final residual scoring use double precision.
+## Retained-composition growth and fitting
 
-## Rigid fitting and readout
+Each pair or triple initializes a distribution from the product of its
+anchors' compatibility rows plus a unit contribution at each anchor.
+Normalization gives a phase of total weight one. Phases evolve independently
+for ten stages:
 
-Each phase produces a weighted Kabsch fit. Two subsequent fits use the estimated
-model's residual-below-`0.04` correspondence mask. Pair phases use support count
-minus a small mean-residual penalty. Triple phases use the extensive score
+$$
+w_i^+\propto (w_i+10^{-30})[1+N(\Lambda w)_i]^2.
+$$
 
-$$M(R,t)=\sum_i\max(1-\|Rp_i+t-q_i\|/\tau,0).$$
+The current composition remains the multiplicative base. Compatibility and
+growth use single precision; distances, triangle geometry, rigid fitting and
+residual readout use double precision.
 
-The correspondence interface returns the pose with highest score. For physical
-residual radius `tau`, matches are multiplied by `0.04 / tau` before this inference,
-and translations are divided by the same scale on output. The physical kernel
-width is therefore `0.375 * tau`.
+Each phase gives a weighted Kabsch fit followed by two hard refits on matches
+below internal residual radius 0.04. The pair native readout is the support
+count minus 0.001 times the mean residual. The triple native readout is
 
-## Budgeted geometric postprocessing
+$$M(R,t)=\sum_i[1-\|Rp_i+t-q_i\|/0.04]_+.$$
 
-The complete surface-assisted estimator includes a reusable pose postprocessor.
-It combines geometric screening, allocation of a fixed candidate-refinement
-budget, two-scale point-to-plane ICP, and a guarded geometry-informed readout.
-Its inputs are candidate poses, a native reference pose, correspondences, and
-observed surfaces. Candidate generation and this verification stage are separate
-components.
+For a physical radius tau, generator inputs are multiplied by 0.04 / tau and
+translations divided by that scale on output. Thus the physical kernel width
+is 0.375 times tau. The correspondence-only interface returns the native
+winner. The complete interface also supplies direct triple-nucleus fits to
+the surface verifier; a pair alone does not define a unique 3D pose.
 
-The surface interface uses the same motif inference at residual radius `tau`.
-All surface-backend coordinates are normalized by `0.1 / tau`; the following
-backend thresholds are stated in that normalized unit. For metre coordinates,
-`tau=0.1` is the indoor radius and `tau=0.6` is the outdoor driving radius.
+## Bounded surface finishing
 
-Surface preparation computes `scaled = points * (0.04 / tau)`, keeps the first
-observation in each internal `0.02` voxel in input order, divides by `0.04 / tau`,
-then applies the backend scale. The physical voxel side is `0.5 * tau`.
+All backend coordinates are normalized by 0.1 / tau. Distances below are in
+these internal surface units. Preparation retains the first observed point
+per physical voxel of side 0.5 times tau, in input order.
 
-Grown hypotheses form the primary pool. A native-winner-preserving shortlist
-retains at most 32 pose modes, and an interleaved stable ranking by `M`, `G` and
-`M*G` allocates at most 16 primary refinements. Direct three-point fits remain
-auxiliary proposals; two-point nuclei have no direct pose proposal.
+A native-winner-preserving shortlist holds at most 32 distinct pose modes,
+using 5 degrees and translation distance 0.1. Interleaved stable rankings by
+correspondence support M, surface support G and their product allocate at
+most 16 primary refinements. Distinct unused poses on the nondominated
+(M, I) frontier provide up to 16 more. Additional candidates are ranked before
+applying the overall budget, so budgets 16 and 32 have nested queues.
 
-The observed source is deterministically divided into fitting and query samples.
-ICP uses the source fitting sample and the complete observed target. Surface
-support uses held-out source queries, sampled target queries, and truncated
-nearest-neighbor distances against the observed surfaces. Uniform
-forward and reverse means give harmonic support `G`. For a query point with
-centred, RMS-normalized coordinate `x` and normal `n`, the Jacobian is
+Each attempt uses point-to-plane ICP at capture radii 0.2 and 0.1, a Tukey
+kernel of scale 0.1, and at most ten iterations per scale. All valid refined
+poses remain eligible for release, including auxiliary poses when a primary
+refinement is invalid.
 
-$$J_i=[(x_i\times n_i)^T,n_i^T],\quad
-\ell_i=J_i\left(\sum_jJ_j^TJ_j\right)^\dagger J_i^T.$$
+## Geometric evidence
 
-Normalized nonnegative leverage values weight the directional supports; their
-harmonic mean gives `I`. Normals use at most 20 neighbors. Initial screening uses
-the first 128 query points per direction with renormalized weights.
+The observed source is deterministically divided into fitting and query
+points. ICP uses the fitting points and the complete observed target.
+Surface evidence uses the disjoint source queries and sampled target queries,
+with at most 4096 queries in either direction.
 
-Pose neighborhoods use `5 degrees` and normalized translation distance `0.1`
-(physical `tau`). The nondominated unused modes in `(M, I)` supply at most 16
-additional refinements. The complete additional queue is stably allocated before
-the global budget is applied. The default B16 and optional B32 cap total
-candidate-refinement attempts on nested prefixes, including auxiliary poses at
-B16 when fewer than 16 primary attempts are available. Each attempt uses
-point-to-plane fitting, normalized Tukey scale `0.1`, and up to two ICP passes at
-capture radii `0.2` then `0.1` (physical `2*tau` then `tau`), with at most 10
-iterations per radius. Invalid intermediate poses terminate the attempt.
+Truncated correspondence support uses radius 0.1. The harmonic mean of
+forward and reverse truncated nearest-neighbor support gives G. To obtain
+information support I, the directional means use normalized leverage weights:
 
-A retained reference pose maximizes `M * sqrt(G)`. A challenger must have
-nondecreasing `I` relative to that reference and strictly improve
-`M * sqrt(I)`. Ties retain the reference. If every primary refinement is invalid, no winner is
-returned. The output is one rigid transformation in the input coordinate unit.
+$$
+J_i=[(\widetilde x_i\times n_i)^T,n_i^T],\qquad
+\ell_i=J_i\left(\sum_jJ_j^TJ_j\right)^\dagger J_i^T.
+$$
+
+Coordinates for these rows are centered and RMS-normalized. Normals use at
+most 20 neighbors. Initial information screening uses 128 queries per
+direction with renormalized weights.
+
+## Complementary release
+
+For every valid refined candidate k, correspondence and information support
+give the normalized channel
+
+$$s_k=\frac{M_k\sqrt{I_k}}{\max_j M_j\sqrt{I_j}}.$$
+
+In each nearest-neighbor direction, retain distances d below 0.1 and set
+u = d squared / 0.1 squared. Its mean is used in the one-sided concentration
+score
+
+$$
+\psi(\bar u)=\sup_{\eta\ge0}
+\left[-\eta\bar u-\log\frac{1-e^{-\eta}}{\eta}\right].
+$$
+
+This is the rate function below the mean of an idealized uniform distribution
+on [0, 1]. It is a residual-concentration score, not a calibrated probability
+of pose correctness. The score is zero for a mean at least one half.
+A monotone bisection solves the positive optimum.
+
+Average the two directional scores into J_k and normalize the shape channel
+as h_k = exp(J_k - max_j J_j). The released pose maximizes
+
+$$\min(s_k,h_k).$$
+
+Ties prefer larger support, then larger shape score, then the earlier queue
+position. The final decision introduces no additional ICP calls.
+
+A candidate with no accepted queries in either direction has no shape
+evidence. If none of the candidates has shape evidence, release uses maximum
+support. If all support scores vanish, it uses the shape channel. Infinite
+concentration scores, produced by exact zero residuals, share the maximal
+shape score. An empty valid refined pool raises ValueError.
+
+## Interfaces and output units
+
+register_correspondences returns R and t from the capacity-aware generator.
+register_with_surfaces runs generation, finishing and release. refine_candidates
+runs finishing and release on externally supplied poses; the native pose and
+all candidate translations must use the same unit as the observed points.
+
+The two surface interfaces return R, t and refinement_count. R maps source to
+target as a column-vector rotation, so NumPy row arrays align as
+p @ R.T + t. Refinement count measures candidate attempts, not the number of
+internal ICP iterations. Coordinate arrays are not modified.

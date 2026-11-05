@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ngr-registration"
-version = "0.1.0"
-description = "Motif-seeded rigid correspondence registration"
+version = "0.2.0"
+description = "Capacity-aware rigid registration with reusable surface verification"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 authors = [{name = "Chengrui Xu"}]
